@@ -1,7 +1,7 @@
 import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-grpc";
 import { Resource } from "@opentelemetry/resources";
-import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION, ATTR_SERVICE_INSTANCE_ID } from "@opentelemetry/semantic-conventions";
+import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import { hostname } from "os";
 
 const OPENCODE_URL = process.env.OPENCODE_URL || "http://host.docker.internal:4096";
@@ -18,7 +18,7 @@ console.log(`Instance ID: ${INSTANCE_ID}`);
 const resource = new Resource({
   [ATTR_SERVICE_NAME]: "opencode",
   [ATTR_SERVICE_VERSION]: "1.0.0",
-  [ATTR_SERVICE_INSTANCE_ID]: INSTANCE_ID,
+  "service.instance.id": INSTANCE_ID,
 });
 
 const metricExporter = new OTLPMetricExporter({
