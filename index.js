@@ -70,7 +70,23 @@ const activeSessionsGauge = meter.createUpDownCounter("opencode.session.active",
 
 // Track state
 const activeSessions = new Set();
+const sessionMetadata = new Map(); // id -> {title, directory, slug}
 const processedMessages = new Set();
+
+// Observable gauge for session info (reports current sessions with metadata)
+meter.createObservableGauge("opencode.session.info", {
+  description: "Session information with metadata labels",
+  unit: "1",
+}, (observableResult) => {
+  for (const [id, meta] of sessionMetadata) {
+    observableResult.observe(1, {
+      session_id: id,
+      slug: meta.slug || "",
+      title: meta.title || "",
+      directory: meta.directory || "",
+    });
+  }
+});
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000;
 
@@ -100,6 +116,7 @@ async function connectAndListen() {
     if (previousCount > 0) {
       activeSessionsGauge.add(-previousCount);
       activeSessions.clear();
+      sessionMetadata.clear();
     }
 
     // Get initial session list
@@ -108,6 +125,11 @@ async function connectAndListen() {
       console.log(`Found ${sessions.length} existing sessions`);
       sessions.forEach(s => {
         activeSessions.add(s.id);
+        sessionMetadata.set(s.id, {
+          slug: s.slug || "",
+          title: s.title || "",
+          directory: s.directory || "",
+        });
       });
       activeSessionsGauge.add(sessions.length);
     }
@@ -171,14 +193,29 @@ function processEvent(event) {
         sessionCounter.add(1);
         if (properties?.id) {
           activeSessions.add(properties.id);
+          sessionMetadata.set(properties.id, {
+            slug: properties.slug || "",
+            title: properties.title || "",
+            directory: properties.directory || "",
+          });
           activeSessionsGauge.add(1);
         }
         console.log(`Session created: ${properties?.id || "unknown"}`);
         break;
 
+      case "session.updated":
+        if (properties?.id && sessionMetadata.has(properties.id)) {
+          const meta = sessionMetadata.get(properties.id);
+          if (properties.title) meta.title = properties.title;
+          if (properties.directory) meta.directory = properties.directory;
+          if (properties.slug) meta.slug = properties.slug;
+        }
+        break;
+
       case "session.deleted":
         if (properties?.id && activeSessions.has(properties.id)) {
           activeSessions.delete(properties.id);
+          sessionMetadata.delete(properties.id);
           activeSessionsGauge.add(-1);
         }
         console.log(`Session deleted: ${properties?.id || "unknown"}`);
