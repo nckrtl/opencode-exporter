@@ -74,10 +74,12 @@ const sessionMetadata = new Map(); // id -> {title, directory, slug}
 const processedMessages = new Set();
 
 // Observable gauge for session info (reports current sessions with metadata)
-meter.createObservableGauge("opencode.session.info", {
+const sessionInfoGauge = meter.createObservableGauge("opencode.session.info", {
   description: "Session information with metadata labels",
   unit: "1",
-}, (observableResult) => {
+});
+
+sessionInfoGauge.addCallback((observableResult) => {
   for (const [id, meta] of sessionMetadata) {
     observableResult.observe(1, {
       session_id: id,
