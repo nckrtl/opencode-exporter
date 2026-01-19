@@ -72,6 +72,9 @@ const activeSessionsGauge = meter.createUpDownCounter("opencode.session.active",
 const activeSessions = new Set();
 const sessionMetadata = new Map(); // id -> {title, directory, slug}
 const processedMessages = new Set();
+const recentErrors = []; // Array of {timestamp, type, message, instance}
+const MAX_ERRORS = 100; // Keep last 100 errors
+const ERROR_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // Observable gauge for session info (reports current sessions with metadata)
 const sessionInfoGauge = meter.createObservableGauge("opencode.session.info", {
@@ -90,6 +93,31 @@ sessionInfoGauge.addCallback((observableResult) => {
     });
   }
 });
+
+// Observable gauge for error details (reports recent errors with full info)
+const errorInfoGauge = meter.createObservableGauge("opencode.error.info", {
+  description: "Recent error information with details",
+  unit: "1",
+});
+
+errorInfoGauge.addCallback((observableResult) => {
+  // Clean up old errors
+  const now = Date.now();
+  while (recentErrors.length > 0 && now - recentErrors[0].timestamp > ERROR_RETENTION_MS) {
+    recentErrors.shift();
+  }
+  
+  // Report each error as a metric observation
+  for (const error of recentErrors) {
+    observableResult.observe(1, {
+      timestamp: new Date(error.timestamp).toISOString(),
+      type: error.type,
+      message: error.message.slice(0, 200), // Truncate long messages
+      instance: error.instance,
+    });
+  }
+});
+
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000;
 
@@ -175,6 +203,17 @@ async function connectAndListen() {
     console.error(`Connection error: ${error.message}`);
     errorCounter.add(1, { type: "connection" });
     
+    // Store connection error details for table view
+    recentErrors.push({
+      timestamp: Date.now(),
+      type: "connection",
+      message: error.message,
+      instance: INSTANCE_ID,
+    });
+    while (recentErrors.length > MAX_ERRORS) {
+      recentErrors.shift();
+    }
+    
     // Exponential backoff reconnect
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
@@ -235,10 +274,24 @@ function processEvent(event) {
         break;
 
       case "error":
-        errorCounter.add(1, { 
-          type: properties?.code || "unknown",
+        const errorType = properties?.code || "unknown";
+        const errorMessage = properties?.message || "unknown";
+        errorCounter.add(1, { type: errorType });
+        
+        // Store error details for table view
+        recentErrors.push({
+          timestamp: Date.now(),
+          type: errorType,
+          message: errorMessage,
+          instance: INSTANCE_ID,
         });
-        console.log(`Error event: ${properties?.message || "unknown"}`);
+        
+        // Keep only last MAX_ERRORS
+        while (recentErrors.length > MAX_ERRORS) {
+          recentErrors.shift();
+        }
+        
+        console.log(`Error event: ${errorMessage}`);
         break;
     }
   } catch (error) {
