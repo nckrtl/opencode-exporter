@@ -1,20 +1,24 @@
 import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-grpc";
 import { Resource } from "@opentelemetry/resources";
-import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
+import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION, ATTR_SERVICE_INSTANCE_ID } from "@opentelemetry/semantic-conventions";
+import { hostname } from "os";
 
 const OPENCODE_URL = process.env.OPENCODE_URL || "http://host.docker.internal:4096";
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://otel-collector:4317";
 const EXPORT_INTERVAL = parseInt(process.env.EXPORT_INTERVAL || "10000", 10);
+const INSTANCE_ID = process.env.INSTANCE_ID || hostname();
 
 console.log(`OpenCode Metrics Exporter starting...`);
 console.log(`OpenCode URL: ${OPENCODE_URL}`);
 console.log(`OTLP Endpoint: ${OTEL_ENDPOINT}`);
+console.log(`Instance ID: ${INSTANCE_ID}`);
 
 // Set up OpenTelemetry
 const resource = new Resource({
   [ATTR_SERVICE_NAME]: "opencode",
   [ATTR_SERVICE_VERSION]: "1.0.0",
+  [ATTR_SERVICE_INSTANCE_ID]: INSTANCE_ID,
 });
 
 const metricExporter = new OTLPMetricExporter({

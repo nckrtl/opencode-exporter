@@ -43,6 +43,7 @@ docker run -d \
 | `OPENCODE_URL` | `http://host.docker.internal:4096` | OpenCode server URL |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4317` | OTLP collector endpoint |
 | `EXPORT_INTERVAL` | `10000` | Metrics export interval (ms) |
+| `INSTANCE_ID` | hostname | Identifier for this instance (e.g., "mac", "server") |
 | `DEBUG` | - | Enable verbose logging |
 
 ### Node.js
