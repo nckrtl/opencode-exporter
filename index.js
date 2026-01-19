@@ -91,6 +91,13 @@ async function connectAndListen() {
       throw new Error("OpenCode server not healthy");
     }
 
+    // Reset session tracking on reconnect to avoid double-counting
+    const previousCount = activeSessions.size;
+    if (previousCount > 0) {
+      activeSessionsGauge.add(-previousCount);
+      activeSessions.clear();
+    }
+
     // Get initial session list
     const sessions = await fetchJson("/session");
     if (Array.isArray(sessions)) {
