@@ -76,47 +76,50 @@ const recentErrors = []; // Array of {timestamp, type, message, instance}
 const MAX_ERRORS = 100; // Keep last 100 errors
 const ERROR_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-// Observable gauge for session info (reports current sessions with metadata)
+// Observable gauges for session and error info
 const sessionInfoGauge = meter.createObservableGauge("opencode.session.info", {
   description: "Session information with metadata labels",
   unit: "1",
 });
 
-sessionInfoGauge.addCallback((observableResult) => {
-  for (const [id, meta] of sessionMetadata) {
-    observableResult.observe(1, {
-      session_id: id,
-      slug: meta.slug || "",
-      title: meta.title || "",
-      directory: meta.directory || "",
-      instance: INSTANCE_ID,
-    });
-  }
-});
-
-// Observable gauge for error details (reports recent errors with full info)
 const errorInfoGauge = meter.createObservableGauge("opencode.error.info", {
   description: "Recent error information with details",
   unit: "1",
 });
 
-errorInfoGauge.addCallback((observableResult) => {
-  // Clean up old errors
-  const now = Date.now();
-  while (recentErrors.length > 0 && now - recentErrors[0].timestamp > ERROR_RETENTION_MS) {
-    recentErrors.shift();
-  }
-  
-  // Report each error as a metric observation
-  for (const error of recentErrors) {
-    observableResult.observe(1, {
-      timestamp: new Date(error.timestamp).toISOString(),
-      type: error.type,
-      message: error.message.slice(0, 200), // Truncate long messages
-      instance: error.instance,
-    });
-  }
-});
+// Use batch callback to report all sessions and errors together
+// Note: Don't use 'instance' as attribute name - it collides with resource attribute
+meter.addBatchObservableCallback(
+  (batchObservableResult) => {
+    // Report all sessions
+    for (const [id, meta] of sessionMetadata) {
+      batchObservableResult.observe(sessionInfoGauge, 1, {
+        session_id: id,
+        slug: meta.slug || "",
+        title: meta.title || "",
+        directory: meta.directory || "",
+        source: INSTANCE_ID,
+      });
+    }
+    
+    // Clean up old errors
+    const now = Date.now();
+    while (recentErrors.length > 0 && now - recentErrors[0].timestamp > ERROR_RETENTION_MS) {
+      recentErrors.shift();
+    }
+    
+    // Report all errors
+    for (const error of recentErrors) {
+      batchObservableResult.observe(errorInfoGauge, 1, {
+        timestamp: new Date(error.timestamp).toISOString(),
+        type: error.type,
+        message: error.message.slice(0, 200),
+        source: error.instance,
+      });
+    }
+  },
+  [sessionInfoGauge, errorInfoGauge]
+);
 
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000;
