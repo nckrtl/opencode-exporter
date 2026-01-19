@@ -13,6 +13,16 @@ A sidecar that connects to OpenCode's API and exports metrics via OpenTelemetry 
 
 ## Usage
 
+### Docker Compose (recommended)
+
+```bash
+# Set your OTLP collector endpoint
+export OTEL_ENDPOINT=http://your-server:4317
+
+# Start
+docker compose up -d
+```
+
 ### Docker
 
 ```bash
