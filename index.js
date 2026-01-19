@@ -86,6 +86,7 @@ sessionInfoGauge.addCallback((observableResult) => {
       slug: meta.slug || "",
       title: meta.title || "",
       directory: meta.directory || "",
+      instance: INSTANCE_ID,
     });
   }
 });
