@@ -7,11 +7,13 @@ import { hostname } from "os";
 const OPENCODE_URL = process.env.OPENCODE_URL || "http://host.docker.internal:4096";
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://otel-collector:4317";
 const EXPORT_INTERVAL = parseInt(process.env.EXPORT_INTERVAL || "10000", 10);
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "30000", 10); // Poll every 30s for Anthropic sessions
 const INSTANCE_ID = process.env.INSTANCE_ID || hostname();
 
 console.log(`OpenCode Metrics Exporter starting...`);
 console.log(`OpenCode URL: ${OPENCODE_URL}`);
 console.log(`OTLP Endpoint: ${OTEL_ENDPOINT}`);
+console.log(`Poll Interval: ${POLL_INTERVAL}ms`);
 console.log(`Instance ID: ${INSTANCE_ID}`);
 
 // Set up OpenTelemetry
@@ -65,6 +67,27 @@ const errorCounter = meter.createCounter("opencode.error.count", {
 
 const activeSessionsGauge = meter.createUpDownCounter("opencode.session.active", {
   description: "Number of active sessions",
+  unit: "1",
+});
+
+// Service status gauge - checks if opencode.service is running
+const serviceRunningGauge = meter.createObservableGauge("opencode.service.running", {
+  description: "Whether opencode.service is running (1=running, 0=not running)",
+  unit: "1",
+});
+
+// Track service status - updated by connection attempts
+let isServiceRunning = 0;
+
+// Register observable callback for service status
+serviceRunningGauge.addCallback((observableResult) => {
+  observableResult.observe(isServiceRunning, { source: INSTANCE_ID });
+});
+
+// Per-session activity counter - increments when a session receives a message
+// Used for time-range aware session counting in Grafana
+const sessionActivityCounter = meter.createCounter("opencode.session.activity", {
+  description: "Activity counter per session (increments on each message)",
   unit: "1",
 });
 
@@ -141,6 +164,7 @@ async function connectAndListen() {
     if (health.healthy) {
       console.log(`Connected to OpenCode v${health.version}`);
       reconnectAttempts = 0;
+      isServiceRunning = 1; // Service is running and healthy
     } else {
       throw new Error("OpenCode server not healthy");
     }
@@ -153,10 +177,12 @@ async function connectAndListen() {
       sessionMetadata.clear();
     }
 
-    // Get initial session list
+    // Get initial session list and backfill historical metrics
     const sessions = await fetchJson("/session");
     if (Array.isArray(sessions)) {
       console.log(`Found ${sessions.length} existing sessions`);
+      
+      // Track sessions for active count
       sessions.forEach(s => {
         activeSessions.add(s.id);
         sessionMetadata.set(s.id, {
@@ -166,7 +192,91 @@ async function connectAndListen() {
         });
       });
       activeSessionsGauge.add(sessions.length);
+      
+      // Count existing sessions for the counter
+      sessionCounter.add(sessions.length);
+      
+      // Backfill historical message/token/tool data
+      // NOTE: Session activity counter is NOT backfilled intentionally - it only tracks
+      // real-time activity so that time-range queries in Grafana are accurate
+      console.log("Backfilling historical metrics from existing sessions...");
+      let totalMessages = 0;
+      let totalTokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      let toolCounts = new Map();
+      
+      for (const session of sessions) {
+        try {
+          const messages = await fetchJson(`/session/${session.id}/message`);
+          if (!Array.isArray(messages)) continue;
+          
+          for (const msg of messages) {
+            if (!msg.info) continue;
+            
+            // Count messages
+            const msgKey = `${msg.info.id}-${msg.info.role}`;
+            if (!processedMessages.has(msgKey)) {
+              processedMessages.add(msgKey);
+              totalMessages++;
+              
+              // Aggregate token usage
+              if (msg.info.tokens) {
+                const t = msg.info.tokens;
+                if (t.input) totalTokens.input += t.input;
+                if (t.output) totalTokens.output += t.output;
+                if (t.cache?.read) totalTokens.cacheRead += t.cache.read;
+                if (t.cache?.write) totalTokens.cacheWrite += t.cache.write;
+              }
+            }
+            
+            // Count tool usage from parts
+            if (msg.parts) {
+              for (const part of msg.parts) {
+                if (part.type === "tool" && part.tool) {
+                  const count = toolCounts.get(part.tool) || 0;
+                  toolCounts.set(part.tool, count + 1);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // Skip sessions we can't fetch messages for
+        }
+      }
+      
+      // Emit backfilled metrics
+      if (totalMessages > 0) {
+        messageCounter.add(totalMessages, { role: "backfill", model: "historical", provider: "historical" });
+        console.log(`Backfilled ${totalMessages} messages`);
+      }
+      
+      if (totalTokens.input > 0) {
+        tokenCounter.add(totalTokens.input, { type: "input", model: "historical", provider: "historical" });
+      }
+      if (totalTokens.output > 0) {
+        tokenCounter.add(totalTokens.output, { type: "output", model: "historical", provider: "historical" });
+      }
+      if (totalTokens.cacheRead > 0) {
+        tokenCounter.add(totalTokens.cacheRead, { type: "cacheRead", model: "historical", provider: "historical" });
+      }
+      if (totalTokens.cacheWrite > 0) {
+        tokenCounter.add(totalTokens.cacheWrite, { type: "cacheCreation", model: "historical", provider: "historical" });
+      }
+      const totalAllTokens = totalTokens.input + totalTokens.output + totalTokens.cacheRead + totalTokens.cacheWrite;
+      if (totalAllTokens > 0) {
+        console.log(`Backfilled ${totalAllTokens} tokens`);
+      }
+      
+      for (const [tool, count] of toolCounts) {
+        toolUseCounter.add(count, { tool, status: "historical" });
+      }
+      if (toolCounts.size > 0) {
+        const totalTools = [...toolCounts.values()].reduce((a, b) => a + b, 0);
+        console.log(`Backfilled ${totalTools} tool uses across ${toolCounts.size} tools`);
+      }
     }
+
+    // Start periodic polling for Anthropic sessions (SSE doesn't broadcast these)
+    startPolling();
 
     // Subscribe to SSE events
     console.log("Subscribing to events...");
@@ -184,6 +294,7 @@ async function connectAndListen() {
       const { done, value } = await reader.read();
       if (done) {
         console.log("Event stream ended");
+        stopPolling();
         break;
       }
 
@@ -205,6 +316,8 @@ async function connectAndListen() {
   } catch (error) {
     console.error(`Connection error: ${error.message}`);
     errorCounter.add(1, { type: "connection" });
+    isServiceRunning = 0; // Service is not running or not reachable
+    stopPolling(); // Stop polling on connection error, will restart on reconnect
     
     // Store connection error details for table view
     recentErrors.push({
@@ -236,34 +349,38 @@ function processEvent(event) {
     switch (type) {
       case "session.created":
         sessionCounter.add(1);
-        if (properties?.id) {
-          activeSessions.add(properties.id);
-          sessionMetadata.set(properties.id, {
-            slug: properties.slug || "",
-            title: properties.title || "",
-            directory: properties.directory || "",
+        // Handle nested info structure
+        const sessionInfo = properties?.info || properties;
+        if (sessionInfo?.id) {
+          activeSessions.add(sessionInfo.id);
+          sessionMetadata.set(sessionInfo.id, {
+            slug: sessionInfo.slug || "",
+            title: sessionInfo.title || "",
+            directory: sessionInfo.directory || "",
           });
           activeSessionsGauge.add(1);
         }
-        console.log(`Session created: ${properties?.id || "unknown"}`);
+        console.log(`Session created: ${sessionInfo?.id || "unknown"}`);
         break;
 
       case "session.updated":
-        if (properties?.id && sessionMetadata.has(properties.id)) {
-          const meta = sessionMetadata.get(properties.id);
-          if (properties.title) meta.title = properties.title;
-          if (properties.directory) meta.directory = properties.directory;
-          if (properties.slug) meta.slug = properties.slug;
+        const updatedSession = properties?.info || properties;
+        if (updatedSession?.id && sessionMetadata.has(updatedSession.id)) {
+          const meta = sessionMetadata.get(updatedSession.id);
+          if (updatedSession.title) meta.title = updatedSession.title;
+          if (updatedSession.directory) meta.directory = updatedSession.directory;
+          if (updatedSession.slug) meta.slug = updatedSession.slug;
         }
         break;
 
       case "session.deleted":
-        if (properties?.id && activeSessions.has(properties.id)) {
-          activeSessions.delete(properties.id);
-          sessionMetadata.delete(properties.id);
+        const deletedSession = properties?.info || properties;
+        if (deletedSession?.id && activeSessions.has(deletedSession.id)) {
+          activeSessions.delete(deletedSession.id);
+          sessionMetadata.delete(deletedSession.id);
           activeSessionsGauge.add(-1);
         }
-        console.log(`Session deleted: ${properties?.id || "unknown"}`);
+        console.log(`Session deleted: ${deletedSession?.id || "unknown"}`);
         break;
 
       case "message.created":
@@ -302,10 +419,18 @@ function processEvent(event) {
   }
 }
 
-function processMessage(properties) {
+function processMessage(properties, sessionId = null) {
   if (!properties) return;
 
-  const { id, role, model } = properties;
+  // Handle nested info structure from SSE events
+  const info = properties.info || properties;
+  const { id, role, modelID, providerID, tokens, finish } = info;
+  
+  // Try to get session ID from properties if not provided
+  const sessId = sessionId || properties.sessionID || properties.session_id || info.sessionID || info.session_id;
+  
+  // Only count completed assistant messages with tokens
+  if (role !== "assistant" || !tokens || !finish) return;
   
   // Avoid counting the same message multiple times
   const msgKey = `${id}-${role}`;
@@ -318,32 +443,37 @@ function processMessage(properties) {
     toDelete.forEach(k => processedMessages.delete(k));
   }
 
+  // Increment per-session activity counter for time-range aware counting
+  if (sessId) {
+    sessionActivityCounter.add(1, { session_id: sessId, source: INSTANCE_ID });
+  }
+
   messageCounter.add(1, {
     role: role || "unknown",
-    model: model?.modelID || "unknown",
-    provider: model?.providerID || "unknown",
+    model: modelID || "unknown",
+    provider: providerID || "unknown",
   });
 
-  // Extract token usage if available
-  if (properties.usage) {
-    const { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = properties.usage;
-    const modelId = model?.modelID || "unknown";
-    const providerId = model?.providerID || "unknown";
-    
-    if (inputTokens) {
-      tokenCounter.add(inputTokens, { type: "input", model: modelId, provider: providerId });
-      console.log(`Tokens: +${inputTokens} input (${modelId})`);
-    }
-    if (outputTokens) {
-      tokenCounter.add(outputTokens, { type: "output", model: modelId, provider: providerId });
-      console.log(`Tokens: +${outputTokens} output (${modelId})`);
-    }
-    if (cacheReadTokens) {
-      tokenCounter.add(cacheReadTokens, { type: "cacheRead", model: modelId, provider: providerId });
-    }
-    if (cacheWriteTokens) {
-      tokenCounter.add(cacheWriteTokens, { type: "cacheCreation", model: modelId, provider: providerId });
-    }
+  // Extract token usage from info.tokens
+  const modelId = modelID || "unknown";
+  const providerId = providerID || "unknown";
+  
+  if (tokens.input) {
+    tokenCounter.add(tokens.input, { type: "input", model: modelId, provider: providerId });
+    console.log(`Tokens: +${tokens.input} input (${modelId})`);
+  }
+  if (tokens.output) {
+    tokenCounter.add(tokens.output, { type: "output", model: modelId, provider: providerId });
+    console.log(`Tokens: +${tokens.output} output (${modelId})`);
+  }
+  if (tokens.cache?.read) {
+    tokenCounter.add(tokens.cache.read, { type: "cacheRead", model: modelId, provider: providerId });
+  }
+  if (tokens.cache?.write) {
+    tokenCounter.add(tokens.cache.write, { type: "cacheCreation", model: modelId, provider: providerId });
+  }
+  if (tokens.reasoning) {
+    tokenCounter.add(tokens.reasoning, { type: "reasoning", model: modelId, provider: providerId });
   }
 }
 
@@ -366,15 +496,125 @@ function processPart(properties) {
   }
 }
 
+// Periodic polling to catch Anthropic sessions that don't broadcast SSE events
+async function pollSessions() {
+  try {
+    const sessions = await fetchJson("/session");
+    if (!Array.isArray(sessions)) return;
+    
+    let newMessages = 0;
+    let newTokens = 0;
+    
+    for (const session of sessions) {
+      // Update session metadata
+      if (!activeSessions.has(session.id)) {
+        activeSessions.add(session.id);
+        activeSessionsGauge.add(1);
+        sessionCounter.add(1);
+      }
+      sessionMetadata.set(session.id, {
+        slug: session.slug || "",
+        title: session.title || "",
+        directory: session.directory || "",
+      });
+      
+      try {
+        const messages = await fetchJson(`/session/${session.id}/message`);
+        if (!Array.isArray(messages)) continue;
+        
+        for (const msg of messages) {
+          if (!msg.info) continue;
+          
+          const { id, role, modelID, providerID, tokens, finish } = msg.info;
+          
+          // Only count completed assistant messages with tokens
+          if (role !== "assistant" || !tokens || !finish) continue;
+          
+          const msgKey = `${id}-${role}`;
+          if (processedMessages.has(msgKey)) continue;
+          processedMessages.add(msgKey);
+          
+          newMessages++;
+          
+          const modelId = modelID || "unknown";
+          const providerId = providerID || "unknown";
+          
+          // Increment per-session activity counter for time-range aware counting
+          sessionActivityCounter.add(1, { session_id: session.id, source: INSTANCE_ID });
+
+          messageCounter.add(1, {
+            role: role,
+            model: modelId,
+            provider: providerId,
+          });
+          
+          if (tokens.input) {
+            tokenCounter.add(tokens.input, { type: "input", model: modelId, provider: providerId });
+            newTokens += tokens.input;
+          }
+          if (tokens.output) {
+            tokenCounter.add(tokens.output, { type: "output", model: modelId, provider: providerId });
+            newTokens += tokens.output;
+          }
+          if (tokens.cache?.read) {
+            tokenCounter.add(tokens.cache.read, { type: "cacheRead", model: modelId, provider: providerId });
+            newTokens += tokens.cache.read;
+          }
+          if (tokens.cache?.write) {
+            tokenCounter.add(tokens.cache.write, { type: "cacheCreation", model: modelId, provider: providerId });
+            newTokens += tokens.cache.write;
+          }
+          if (tokens.reasoning) {
+            tokenCounter.add(tokens.reasoning, { type: "reasoning", model: modelId, provider: providerId });
+            newTokens += tokens.reasoning;
+          }
+        }
+      } catch (e) {
+        // Skip sessions we can't fetch messages for
+      }
+    }
+    
+    if (newMessages > 0 || newTokens > 0) {
+      console.log(`Poll: +${newMessages} messages, +${newTokens} tokens`);
+    }
+    
+    // Keep processedMessages from growing indefinitely
+    if (processedMessages.size > 10000) {
+      const toDelete = [...processedMessages].slice(0, 5000);
+      toDelete.forEach(k => processedMessages.delete(k));
+    }
+  } catch (error) {
+    if (process.env.DEBUG) {
+      console.error(`Poll error: ${error.message}`);
+    }
+  }
+}
+
+let pollInterval;
+
+function startPolling() {
+  console.log(`Starting periodic polling every ${POLL_INTERVAL}ms...`);
+  pollInterval = setInterval(pollSessions, POLL_INTERVAL);
+}
+
+function stopPolling() {
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+}
+
 // Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("Shutting down...");
+  stopPolling();
   await meterProvider.shutdown();
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
   console.log("Shutting down...");
+  stopPolling();
   await meterProvider.shutdown();
   process.exit(0);
 });
