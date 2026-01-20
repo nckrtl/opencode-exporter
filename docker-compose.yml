@@ -3,7 +3,7 @@ services:
     build: .
     environment:
       OPENCODE_URL: http://host.docker.internal:4096
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}
       EXPORT_INTERVAL: "10000"
       INSTANCE_ID: ${INSTANCE_ID:-}
     extra_hosts:
